@@ -125,6 +125,16 @@ class LlamaConfig(PretrainedConfig):
             Whether to use a bias in up_proj, down_proj and gate_proj layers in the MLP layers.
         head_dim (`int`, *optional*):
             The attention head dimension. If None, it will default to hidden_size // num_heads
+         norm_qk (`bool`, *optional*, defaults to True):
+            Whether to normalize queries and keys in hypersphere attention.
+        num_hyperspheres (`int`, *optional*, defaults to 1):
+            Number of hyperspheres to use in hypersphere attention. Allows splitting the embedding space into multiple spheres.
+        attention_norm_eps (`float`, *optional*, defaults to 0.0):
+            The epsilon used for hypersphere normalization. When > 0, allows the norm to be around (1 - eps) to (1 + eps).
+        s_qk_init (`float`, *optional*, defaults to 1.0):
+            Initial value for the query/key scaling factor in hypersphere attention.
+        s_qk_scale (`float`, *optional*, defaults to None):
+            Scale for the query/key scaling factor. If None, defaults to hidden_size ** -1.
 
     ```python
     >>> from transformers import LlamaModel, LlamaConfig
@@ -166,6 +176,12 @@ class LlamaConfig(PretrainedConfig):
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
+        # New hypersphere attention parameters
+        norm_qk=True,
+        num_hyperspheres=1,
+        attention_norm_eps=0.0,
+        s_qk_init=1.0,
+        s_qk_scale=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -191,6 +207,14 @@ class LlamaConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.mlp_bias = mlp_bias
         self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
+
+        # New hypersphere attention parameters
+        self.norm_qk = norm_qk
+        self.num_hyperspheres = num_hyperspheres
+        self.attention_norm_eps = attention_norm_eps
+        self.s_qk_init = s_qk_init
+        self.s_qk_scale = s_qk_scale if s_qk_scale is not None else hidden_size ** -1
+        
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, copy it it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
