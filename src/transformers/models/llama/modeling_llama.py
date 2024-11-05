@@ -51,7 +51,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_llama import LlamaConfig
-
+from torch.nn.attention import SDPBackend
 
 logger = logging.get_logger(__name__)
 
@@ -520,6 +520,182 @@ class LlamaFlashAttention2(LlamaAttention):
 
         return attn_output, attn_weights, past_key_value
 
+class LlamaHypersphereAttention(LlamaAttention):
+    """
+    LLaMA attention module using hypersphere attention mechanism with full caching support.
+    Compatible with both DynamicCache and StaticCache implementations.
+    """
+    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        
+        # Additional config parameters for hypersphere attention
+        self.norm_qk = getattr(config, "norm_qk", True)
+        self.num_hyperspheres = getattr(config, "num_hyperspheres", 1)
+        self.norm_eps = getattr(config, "attention_norm_eps", 0.0)
+        
+        # Learned scaling factor for Q/K
+        self.s_qk_init = getattr(config, "s_qk_init", 1.0)
+        self.s_qk_scale = getattr(config, "s_qk_scale", None)
+        if self.s_qk_scale is None:
+            self.s_qk_scale = config.hidden_size ** -1
+            
+        # Initialize the learned scale parameter
+        self.qk_scale = nn.Parameter(torch.ones(self.num_heads * self.head_dim) * self.s_qk_init)
+        self.forward_scale = self.s_qk_init / self.s_qk_scale
+
+        # Setup SDPA backend configuration
+        sdpa_backends = [
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
+            SDPBackend.CUDNN_ATTENTION
+        ]
+        self.sdpa_context_manager = partial(torch.nn.attention.sdpa_kernel, sdpa_backends)
+        
+    def l2norm(self, t, dim=-1):
+        """
+        L2 normalization with support for multiple hyperspheres
+        """
+        if self.num_hyperspheres > 1:
+            t = t.chunk(self.num_hyperspheres, dim=dim)
+            t = torch.stack(t)
+            
+        if self.norm_eps == 0.0:
+            out = F.normalize(t, dim=dim, p=2)
+        else:
+            eps = 1e-5 if t.dtype == torch.float16 else 1e-10
+            norm = t.norm(dim=dim, keepdim=True)
+            target_norm = norm.detach().clamp(min=1.0 - self.norm_eps, max=1.0 + self.norm_eps)
+            divisor = norm / target_norm
+            out = t / divisor.clamp(min=eps)
+            
+        if self.num_hyperspheres > 1:
+            out = torch.cat([*out], dim=dim)
+            
+        return out
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if isinstance(past_key_value, StaticCache):
+            raise ValueError(
+                "`static` cache implementation is not compatible with `attn_implementation=hypersphere_attention`. "
+                "Please use `sdpa` or disable the static cache."
+            )
+
+        if output_attentions:
+            logger.warning_once(
+                "LlamaModel is using LlamaHypersphereAttention, but `torch.nn.functional.scaled_dot_product_attention` "
+                "does not support `output_attentions=True`. Falling back to the manual attention implementation."
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.config.pretraining_tp > 1:
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
+            query_slices = self.q_proj.weight.split(
+                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+            )
+            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
+            query_states = torch.cat(query_states, dim=-1)
+
+            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+            key_states = torch.cat(key_states, dim=-1)
+
+            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
+            value_states = torch.cat(value_states, dim=-1)
+
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        # Apply rotary embeddings
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Handle past key values for caching
+        if past_key_value is not None:
+            # Update cache with correct position information
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # Apply hypersphere normalization to queries and keys if enabled
+        if self.norm_qk:
+            query_states = self.l2norm(query_states, dim=-1)
+            key_states = self.l2norm(key_states, dim=-1)
+
+        # Apply learned scaling
+        qk_scale = self.qk_scale.view(self.num_heads, 1, self.head_dim) * self.forward_scale
+        query_states = query_states * qk_scale
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Handle attention mask and causal masking
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend bugfix for non-contiguous inputs
+        if query_states.device.type == "cuda" and causal_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        # Determine if we can use causal optimization
+        is_causal = True if causal_mask is None and q_len > 1 else False
+
+        # Use scaled_dot_product_attention with optimized backend
+        with self.sdpa_context_manager():
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=causal_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+                scale=self.head_dim ** -0.5
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        if not use_cache:
+            return attn_output, None, None
+
+        return attn_output, None, past_key_value
 
 class LlamaSdpaAttention(LlamaAttention):
     """
@@ -624,6 +800,7 @@ LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
     "flash_attention_2": LlamaFlashAttention2,
     "sdpa": LlamaSdpaAttention,
+    "hypersphere_attention": LlamaHypersphereAttention,
 }
 
 
